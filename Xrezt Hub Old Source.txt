@@ -1,9 +1,10 @@
---// Xrezt Hub | JJS Premium — optimized core
-local Library      = loadstring(game:HttpGet('https://raw.githubusercontent.com/deividcomsono/Obsidian/main/Library.lua'))()
+local Library = loadstring(game:HttpGet('https://raw.githubusercontent.com/deividcomsono/Obsidian/main/Library.lua'))()
 local ThemeManager = loadstring(game:HttpGet('https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/ThemeManager.lua'))()
-local SaveManager  = loadstring(game:HttpGet('https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/SaveManager.lua'))()
+local SaveManager = loadstring(game:HttpGet('https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/SaveManager.lua'))()
 
-local Options, Toggles = Library.Options, Library.Toggles
+local Options = Library.Options
+local Toggles = Library.Toggles
+
 Library.ForceCheckbox = false
 Library.ShowToggleFrameInKeybinds = true
 
@@ -21,80 +22,145 @@ local AutoTab   = Window:AddTab('Auto', 'zap')
 local ConfigTab = Window:AddTab('Settings', 'settings')
 
 --// Services
-local Players           = game:GetService('Players')
-local RunService        = game:GetService('RunService')
-local ReplicatedStorage = game:GetService('ReplicatedStorage')
-local Stats             = game:GetService('Stats')
+local Players               = game:GetService('Players')
+local RunService            = game:GetService('RunService')
+local ReplicatedStorage     = game:GetService('ReplicatedStorage')
+local Workspace             = game:GetService('Workspace')
+local UserInputService      = game:GetService('UserInputService')
+local ContextActionService  = game:GetService("ContextActionService")
+local TweenService          = game:GetService("TweenService")
+local UserGameSettings      = UserSettings():GetService("UserGameSettings")
+local VirtualInputManager   = game:GetService("VirtualInputManager")
+local Stats                 = game:GetService("Stats")
 
 local LocalPlayer = Players.LocalPlayer
-local Camera      = workspace.CurrentCamera
 
---// Locals (hot path)
-local abs, max, find, lower, match = math.abs, math.max, string.find, string.lower, string.match
-local tinsert, tfind, tremove, tclear = table.insert, table.find, table.remove, table.clear
+-- Camera must not be cached permanently; it changes on respawn/spectate.
+local Camera = Workspace.CurrentCamera
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    if Workspace.CurrentCamera then
+        Camera = Workspace.CurrentCamera
+    end
+end)
+
+--// Localized math / constructors (hot-path micro-opt)
+local math_abs    = math.abs
+local math_clamp  = math.clamp
+local math_acos   = math.acos
+local math_floor  = math.floor
+local math_max    = math.max
+local math_exp    = math.exp
+local Vector3_new = Vector3.new
+local Vector2_new = Vector2.new
+local CFrame_new  = CFrame.new
+local RaycastParams_new = RaycastParams.new
+local Enum_RaycastFilterType_Exclude = Enum.RaycastFilterType.Exclude
+local table_unpack = table.unpack or unpack
+local string_find  = string.find
+local string_lower = string.lower
+local string_match = string.match
 
 --// State
-local ActiveConnections     = {}
-local ActiveBlockingTracks  = {}
-local ActiveProjectileTracks= {}
-local AlwaysDownslamActive  = false
-local AllAnimationNames     = { "Loading animations..." }
-local AnimationExclusionList= {}
-local ExclusionSet          = {}   -- O(1) exclusion lookups
-local dashInProgress        = false
+local ActiveConnections      = {}
+local ActiveBlockingTracks   = {}
+local ActiveProjectileTracks = {}
+local MobileButtons          = {}
+local LastHitGlowTime        = 0
+local AlwaysDownslamActive   = false
+local InfiniteParkourActive  = false
 
-_G.BfcOrbitAngle = _G.BfcOrbitAngle or 0
+local glideInProgress   = false
+local dashInProgress    = false
+local positionHistory   = {}
+local ghostModel        = nil
+local ghostPartsCache   = {}
+local MAX_HISTORY       = 150
 
---// Fast helpers ------------------------------------------------------------
-local function tog(name)  local t = Toggles[name]  return t and t.Value end
-local function opt(name, default)
-    local o = Options[name]
-    if o == nil then return default end
-    return o.Value
+local AllAnimationNames     = {"Loading animations..."}
+local AnimationExclusionList = {}
+
+-- Track BFC circle dash angle state globally to maintain continuity
+if _G.BfcOrbitAngle == nil then
+    _G.BfcOrbitAngle = 0
 end
 
---// Movement keyword matching: single cached scan instead of 26 finds/anim
+--// Forward declarations (fixes nil-call on functions defined further down)
+local startCurveGlide
+local startLegitCurveGlide
+local getNearestTarget
+local performSidedash
+local fireActivated
+local startLockOn
+
 local MovementStateKeywords = {
-    "run","chase","down","fall","ragdoll","idle","walk","jump","dash","climb",
-    "getup","land","sprint","movement","turn","halt","hover","sleep","emote",
-    "spawn","dance","wave","sit","block"
+    "run", "chase", "down", "fall", "ragdoll", "idle",
+    "walk", "jump", "dash", "climb", "getup", "land",
+    "sprint", "movement", "turn", "halt", "hover", "sleep",
+    "emote", "spawn", "dance", "wave", "sit", "block"
 }
-local movementCache = setmetatable({}, { __mode = "k" })
-local function IsMovementName(name)
-    local cached = movementCache[name]
+local MOVEMENT_KEYWORD_COUNT = #MovementStateKeywords
+
+-- Memoized keyword test: the same animation names repeat constantly,
+-- so we only pay for the linear scan once per unique name.
+local MovementNameCache = {}
+local function IsMovementName(animationName)
+    local cached = MovementNameCache[animationName]
     if cached ~= nil then return cached end
-    local l = lower(name)
-    local hit = false
-    for i = 1, #MovementStateKeywords do
-        if find(l, MovementStateKeywords[i], 1, true) then hit = true break end
+    local lowerName = string_lower(animationName)
+    local result = false
+    for i = 1, MOVEMENT_KEYWORD_COUNT do
+        if string_find(lowerName, MovementStateKeywords[i], 1, true) then
+            result = true
+            break
+        end
     end
-    movementCache[name] = hit
-    return hit
+    MovementNameCache[animationName] = result
+    return result
 end
 
---// Animation id sets (unchanged data, kept as hash lookups)
 local ProjectileAnimations = {
-    ["116432619539029"]=true,["17324258817"]=true,["127851700400958"]=true,["16705392699"]=true,
-    ["137654778575373"]=true,["137865634124104"]=true,["72548435296350"]=true,["725484352963"]=true,
-    ["84547415708554"]=true,["110978068388232"]=true,["104749346956269"]=true,["124901309160375"]=true,
-    ["89092734635186"]=true,["110146909061402"]=true,["105376952884290"]=true,["123414935051274"]=true,
-    ["108636011034323"]=true,["132653290201368"]=true,["121984128639453"]=true,["101617544363219"]=true,
-    ["75736902190737"]=true,["118861398234801"]=true,["132725601768618"]=true,["77200218033775"]=true,
-    ["82541714192027"]=true,["72063002791216"]=true,["79619765411660"]=true,["81112033595734"]=true,
-    ["81630213087988"]=true,["105077924973072"]=true,["95295463826732"]=true,["124862357369335"]=true,
-    ["115234621584704"]=true,["84039122607068"]=true,["127171275866632"]=true,["100446064103831"]=true,
-    ["94720627091769"]=true,["111720035828971"]=true,["89652378115594"]=true,["124340599144108"]=true,
-    ["71186534081075"]=true,["129132347098646"]=true,["129678103897608"]=true,["134777193523837"]=true,
-    ["79538775132859"]=true,["85783365130041"]=true,["84827960380871"]=true,["72933571933445"]=true,
-    ["103013818601982"]=true,["97868312130612"]=true,["94588892125071"]=true,["140588454098230"]=true,
-    ["138826758216894"]=true,["105287938257399"]=true,["96185406489877"]=true,["75337033003776"]=true,
-    ["138489871864252"]=true,["119042572747325"]=true,["71784337627181"]=true,["125120382787311"]=true,
-    ["96327114254575"]=true,["107029561762376"]=true,["117831239064143"]=true,["133936641185614"]=true,
-    ["122573730331631"]=true,["82400997593751"]=true,["118634493886688"]=true,["132855702748568"]=true,
-    ["99205259396653"]=true,["108027796023968"]=true,["85068785050521"]=true,["79086910454958"]=true,
-    ["107825127494342"]=true,["97504088532041"]=true,["106474043944206"]=true,["91990544700842"]=true,
-    ["79271374075726"]=true,["139833047658617"]=true,["125689391910002"]=true,["84080901810314"]=true,
-    ["140597320237985"]=true,["99451940496871"]=true,["130284226842903"]=true,
+    ["116432619539029"] = true, ["17324258817"]     = true,
+    ["127851700400958"] = true, ["16705392699"]     = true,
+    ["137654778575373"] = true, ["137865634124104"] = true,
+    ["72548435296350"]  = true, ["725484352963"]    = true,
+    ["84547415708554"]  = true, ["110978068388232"] = true,
+    ["104749346956269"] = true, ["124901309160375"] = true,
+    ["89092734635186"]  = true, ["110146909061402"] = true,
+    ["105376952884290"] = true, ["123414935051274"] = true,
+    ["108636011034323"] = true, ["132653290201368"] = true,
+    ["121984128639453"] = true, ["101617544363219"] = true,
+    ["75736902190737"]  = true, ["118861398234801"] = true,
+    ["132725601768618"] = true, ["77200218033775"]  = true,
+    ["82541714192027"]  = true, ["72063002791216"]  = true,
+    ["79619765411660"]  = true, ["81112033595734"]  = true,
+    ["81630213087988"]  = true, ["105077924973072"] = true,
+    ["95295463826732"]  = true, ["124862357369335"] = true,
+    ["115234621584704"] = true, ["84039122607068"]  = true,
+    ["127171275866632"] = true, ["100446064103831"] = true,
+    ["94720627091769"]  = true, ["111720035828971"] = true,
+    ["89652378115594"]  = true, ["124340599144108"] = true,
+    ["71186534081075"]  = true, ["129132347098646"] = true,
+    ["129678103897608"] = true, ["134777193523837"] = true,
+    ["79538775132859"]  = true, ["85783365130041"]  = true,
+    ["84827960380871"]  = true, ["72933571933445"]  = true,
+    ["103013818601982"] = true, ["97868312130612"]  = true,
+    ["94588892125071"]  = true, ["140588454098230"] = true,
+    ["138826758216894"] = true, ["105287938257399"] = true,
+    ["96185406489877"]  = true, ["75337033003776"]  = true,
+    ["138489871864252"] = true, ["119042572747325"] = true,
+    ["71784337627181"]  = true, ["125120382787311"] = true,
+    ["96327114254575"]  = true, ["107029561762376"] = true,
+    ["117831239064143"] = true, ["133936641185614"] = true,
+    ["122573730331631"] = true, ["82400997593751"]  = true,
+    ["118634493886688"] = true, ["132855702748568"] = true,
+    ["99205259396653"]  = true, ["108027796023968"] = true,
+    ["85068785050521"]  = true, ["79086910454958"]  = true,
+    ["107825127494342"] = true, ["97504088532041"]  = true,
+    ["106474043944206"] = true, ["91990544700842"]  = true,
+    ["79271374075726"]  = true, ["139833047658617"] = true,
+    ["125689391910002"] = true, ["84080901810314"]  = true,
+    ["140597320237985"] = true, ["99451940496871"]  = true,
+    ["130284226842903"] = true,
 }
 
 local AnimationTriggers = {
@@ -103,312 +169,352 @@ local AnimationTriggers = {
     ["rbxassetid://74145636023952"]  = 0.19,
     ["rbxassetid://72475960800126"]  = 0.20,
 }
-local StraightAnimations = { ["rbxassetid://123171106092050"] = true }
 
---// Cache anim id -> raw digits, avoids a string.match every AnimationPlayed
-local rawIdCache = {}
-local function RawId(animationId)
-    local c = rawIdCache[animationId]
-    if c == nil then
-        c = match(animationId, "%d+") or false
-        rawIdCache[animationId] = c
-    end
-    return c or nil
-end
+local StraightAnimations = {
+    ["rbxassetid://123171106092050"] = true,
+}
 
---// Knit service cache -------------------------------------------------------
-local cachedServices, remoteCache = nil, {}
+local MAHITO_BF_ANIM = "72475960800126"
+local MahitoConnection = nil
+
+--// Knit service cache
+local cachedServices = nil
 local function GetKnitServices()
     if cachedServices and cachedServices.Parent then return cachedServices end
     local knit = ReplicatedStorage:FindFirstChild("Knit")
-    local inner = knit and knit:FindFirstChild("Knit")
-    cachedServices = inner and inner:FindFirstChild("Services") or nil
+    if not knit then return nil end
+    local innerKnit = knit:FindFirstChild("Knit")
+    if not innerKnit then return nil end
+    cachedServices = innerKnit:FindFirstChild("Services")
     return cachedServices
 end
 
--- one lookup per (service, remote) pair, then cached forever
-local function GetRemote(serviceName, remoteName)
-    local key = serviceName .. "/" .. remoteName
-    local r = remoteCache[key]
-    if r and r.Parent then return r end
-    local services = GetKnitServices()
-    local svc = services and services:FindFirstChild(serviceName)
-    local re  = svc and svc:FindFirstChild("RE")
-    r = re and re:FindFirstChild(remoteName) or nil
-    remoteCache[key] = r
-    return r
-end
-
-local function FireRemote(serviceName, remoteName, ...)
-    local remote = GetRemote(serviceName, remoteName)
-    if not remote then return false end
-    local ok = pcall(remote.FireServer, remote, ...)
-    return ok
-end
-
---// Ping sampler (event-free, low cost)
-local networkPing = 0.06
-task.spawn(function()
-    local net = Stats.Network
-    while task.wait(2) do
-        local ok, item = pcall(function() return net.ServerStatsItem["Data Ping"] end)
-        if ok and item then
-            local n = tonumber(match(item:GetValueString(), "%d+"))
-            if n then networkPing = n / 1000 end
-        end
-    end
-end)
-
---// Character refs cached on respawn instead of FindFirstChild per frame ------
-local LocalChar, LocalRoot, LocalHum
-local function BindCharacter(char)
-    LocalChar = char
-    LocalRoot = char and char:WaitForChild("HumanoidRootPart", 5) or nil
-    LocalHum  = char and char:FindFirstChildOfClass("Humanoid") or nil
-end
-BindCharacter(LocalPlayer.Character)
-tinsert(ActiveConnections, LocalPlayer.CharacterAdded:Connect(BindCharacter))
-tinsert(ActiveConnections, LocalPlayer.CharacterRemoving:Connect(function()
-    LocalChar, LocalRoot, LocalHum = nil, nil, nil
-end))
-
---// Mahito auto-blackflash ----------------------------------------------------
-local MAHITO_BF_ANIM = "72475960800126"
-local MahitoConnection
 local function SetupMahitoCharacter(character)
-    if MahitoConnection then MahitoConnection:Disconnect() MahitoConnection = nil end
+    if MahitoConnection then
+        MahitoConnection:Disconnect()
+        MahitoConnection = nil
+    end
     if not character then return end
-    local hum = character:WaitForChild("Humanoid", 5)
-    local animator = hum and hum:WaitForChild("Animator", 5)
+    local humanoid = character:WaitForChild("Humanoid", 5)
+    if not humanoid then return end
+    local animator = humanoid:WaitForChild("Animator", 5)
     if not animator then return end
 
     MahitoConnection = animator.AnimationPlayed:Connect(function(track)
-        if not tog("AutoMahitoBlackflash") then return end
+        local toggle = Toggles.AutoMahitoBlackflash
+        if not toggle or not toggle.Value then return end
         local anim = track.Animation
-        if not anim or not find(anim.AnimationId, MAHITO_BF_ANIM, 1, true) then return end
-        task.delay(0.2, function()
-            local moveset = character:FindFirstChild("Moveset")
-            local move = moveset and moveset:FindFirstChild("Focus Strike")
-            if move then FireRemote("FocusStrikeService", "Activated", move) end
+        if not anim then return end
+        if not string_find(anim.AnimationId, MAHITO_BF_ANIM, 1, true) then return end
+
+        task.spawn(function()
+            task.wait(0.2)
+            pcall(function()
+                local services = GetKnitServices()
+                local fss = services and services:FindFirstChild("FocusStrikeService")
+                local re = fss and fss:FindFirstChild("RE")
+                local activated = re and re:FindFirstChild("Activated")
+                local moveset = character:FindFirstChild("Moveset")
+                local focusStrike = moveset and moveset:FindFirstChild("Focus Strike")
+                if activated and focusStrike then
+                    activated:FireServer(focusStrike)
+                end
+            end)
         end)
     end)
-    tinsert(ActiveConnections, MahitoConnection)
+    table.insert(ActiveConnections, MahitoConnection)
 end
 
---// Namecall hook: single early-out, no table alloc on the common path --------
+--// Ping tracking (hoisted lookup, single Stats reference)
+local networkPing = 0.06
+task.spawn(function()
+    local pingItem
+    while task.wait(1.5) do
+        pcall(function()
+            if not pingItem then
+                pingItem = Stats.Network.ServerStatsItem["Data Ping"]
+            end
+            if pingItem then
+                local pingNum = tonumber(string_match(pingItem:GetValueString(), "%d+"))
+                if pingNum then networkPing = pingNum / 1000 end
+            end
+        end)
+    end
+end)
+
+local staticRayParams = RaycastParams_new()
+staticRayParams.FilterType = Enum_RaycastFilterType_Exclude
+staticRayParams.IgnoreWater = true
+
+--// Namecall hook: fast-path out before allocating the varargs table.
 local oldNamecall
 oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-    if getnamecallmethod() ~= "FireServer" then
+    local method = getnamecallmethod()
+    if method ~= "FireServer" then
         return oldNamecall(self, ...)
     end
 
-    local name = rawget(self, "Name") or self.Name
-    if name ~= "Activated" then return oldNamecall(self, ...) end
+    local bfcToggle = Toggles.BfcEnabled
+    local bfcOn = bfcToggle and bfcToggle.Value
+    if not AlwaysDownslamActive and not bfcOn then
+        return oldNamecall(self, ...)
+    end
 
-    local re = self.Parent
-    local service = re and re.Parent
-    if not service or re.Name ~= "RE" then return oldNamecall(self, ...) end
+    local parent = self.Parent
+    local isActivatedRemote = self.Name == "Activated" and parent and parent.Name == "RE"
 
-    -- Always Downslam: rewrite arg 1 only when it's the equipped moveset
-    if AlwaysDownslamActive and service.Name == (LocalPlayer:GetAttribute("Moveset") or "") .. "Service" then
-        local args = { ... }
-        if args[1] == false then
-            args[1] = "Down"
-            return oldNamecall(self, table.unpack(args))
+    if AlwaysDownslamActive and isActivatedRemote then
+        local service = parent.Parent
+        local moveset = LocalPlayer:GetAttribute("Moveset")
+        if service and moveset and service.Name == (moveset .. "Service") then
+            local args = { ... }
+            if args[1] == false then
+                args[1] = "Down"
+            end
+            return oldNamecall(self, table_unpack(args))
         end
     end
 
-    -- BFC dash-behind
-    if service.Name == "DivergentFistService"
-        and not dashInProgress
-        and tog("BfcEnabled") and tog("BfcDashBehind") then
-        task.delay(0.08, function()
-            if startCurveGlide then startCurveGlide() end
-        end)
+    if bfcOn and not dashInProgress and isActivatedRemote then
+        local service = parent.Parent
+        if service and service.Name == "DivergentFistService" then
+            local dashBehind = Toggles.BfcDashBehind
+            if dashBehind and dashBehind.Value then
+                task.spawn(function()
+                    task.wait(0.08)
+                    startCurveGlide()
+                end)
+            end
+        end
     end
 
     return oldNamecall(self, ...)
 end)
 
---// Block ref-counting --------------------------------------------------------
+--// Block reference counting
 local GlobalBlockCount = 0
-local function FireBlockActivated()
-    if GlobalBlockCount == 0 then FireRemote("BlockService", "Activated") end
-    GlobalBlockCount += 1
-end
-local function FireBlockDeactivated()
-    GlobalBlockCount = max(0, GlobalBlockCount - 1)
-    if GlobalBlockCount == 0 then FireRemote("BlockService", "Deactivated") end
-end
-local function ForceReleaseBlock()
-    GlobalBlockCount = 0
-    FireRemote("BlockService", "Deactivated")
+
+local function GetBlockRemote(name)
+    local services = GetKnitServices()
+    local blockService = services and services:FindFirstChild("BlockService")
+    local re = blockService and blockService:FindFirstChild("RE")
+    return re and re:FindFirstChild(name)
 end
 
---// State checks --------------------------------------------------------------
+local function FireBlockActivated()
+    if GlobalBlockCount == 0 then
+        local activated = GetBlockRemote("Activated")
+        if activated then
+            pcall(function() activated:FireServer() end)
+        end
+    end
+    GlobalBlockCount = GlobalBlockCount + 1
+end
+
+local function FireBlockDeactivated()
+    GlobalBlockCount = math_max(0, GlobalBlockCount - 1)
+    if GlobalBlockCount == 0 then
+        local deactivated = GetBlockRemote("Deactivated")
+        if deactivated then
+            pcall(function() deactivated:FireServer() end)
+        end
+    end
+end
+
+local function ForceReleaseBlock()
+    GlobalBlockCount = 0
+    local deactivated = GetBlockRemote("Deactivated")
+    if deactivated then
+        pcall(function() deactivated:FireServer() end)
+    end
+end
+
+--// Local player state helpers
 local function IsLocalPlayerAttacking()
-    if not LocalHum then return false end
-    for _, track in ipairs(LocalHum:GetPlayingAnimationTracks()) do
-        if track.IsPlaying and not IsMovementName(track.Animation.Name) then return true end
+    local localChar = LocalPlayer.Character
+    if not localChar then return false end
+    local humanoid = localChar:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return false end
+    for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do
+        if track.IsPlaying then
+            local anim = track.Animation
+            if anim and not IsMovementName(anim.Name) then
+                return true
+            end
+        end
     end
     return false
 end
 
-local function IsIncapacitated(char)
-    if not char then return true end
-    if char:GetAttribute("Dead") then return true end
-    local rag = char:GetAttribute("Ragdoll")
-    return (rag and rag > 0) or false
+local function IsLocalPlayerIncapacitated()
+    local localChar = LocalPlayer.Character
+    if not localChar then return true end
+    if localChar:GetAttribute("Dead") then return true end
+    local ragdollVal = localChar:GetAttribute("Ragdoll")
+    if ragdollVal and ragdollVal > 0 then return true end
+    return false
 end
 
---// Dropdown registry ---------------------------------------------------------
-local knownAnimNames = {}
-local dropdownDirty = false
 local function RegisterTrackToDropdown(animationName)
-    if knownAnimNames[animationName] or IsMovementName(animationName) then return end
-    knownAnimNames[animationName] = true
-    if AllAnimationNames[1] == "Loading animations..." then tremove(AllAnimationNames, 1) end
-    tinsert(AllAnimationNames, animationName)
-    dropdownDirty = true
+    if IsMovementName(animationName) then return end
+    if table.find(AllAnimationNames, animationName) then return end
+    if AllAnimationNames[1] == "Loading animations..." then
+        table.remove(AllAnimationNames, 1)
+    end
+    table.insert(AllAnimationNames, animationName)
+    table.sort(AllAnimationNames)
+    if Options.AnimationsList then
+        Options.AnimationsList:SetValues(AllAnimationNames)
+    end
 end
--- batched UI refresh (sorting/SetValues per animation was a real stutter source)
-task.spawn(function()
-    while task.wait(1) do
-        if dropdownDirty and Options.AnimationsList then
-            dropdownDirty = false
-            table.sort(AllAnimationNames)
-            Options.AnimationsList:SetValues(AllAnimationNames)
+
+local function IsEnemyFeinting(character)
+    local toggle = Toggles.AntiFeintEnabled
+    if not toggle or not toggle.Value then return false end
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return false end
+    local feintInstance = rootPart:FindFirstChild("Feint")
+    if not feintInstance then return false end
+    local ringParticle = feintInstance:FindFirstChild("Ring")
+    if not (ringParticle and ringParticle:IsA("ParticleEmitter")) then return false end
+    for _, keypoint in ipairs(ringParticle.Color.Keypoints) do
+        local val = keypoint.Value
+        if math_abs(val.R - val.G) < 0.05 and math_abs(val.G - val.B) < 0.05 then
+            return true
         end
     end
-end)
-
-local function RebuildExclusionSet()
-    tclear(ExclusionSet)
-    for _, n in ipairs(AnimationExclusionList) do ExclusionSet[n] = true end
-end
-
---// Feint detection (cached per emitter) --------------------------------------
-local feintCache = setmetatable({}, { __mode = "k" })
-local function IsEnemyFeinting(character)
-    if not tog("AntiFeintEnabled") then return false end
-    local root = character:FindFirstChild("HumanoidRootPart")
-    local feint = root and root:FindFirstChild("Feint")
-    local ring = feint and feint:FindFirstChild("Ring")
-    if not (ring and ring:IsA("ParticleEmitter")) then return false end
-
-    local cached = feintCache[ring]
-    if cached ~= nil then return cached end
-    local grey = false
-    for _, kp in ipairs(ring.Color.Keypoints) do
-        local v = kp.Value
-        if abs(v.R - v.G) < 0.05 and abs(v.G - v.B) < 0.05 then grey = true break end
-    end
-    feintCache[ring] = grey
-    return grey
+    return false
 end
 
 local function GetCurrentMoveset()
-    if not LocalChar then return nil end
-    local attr = LocalChar:GetAttribute("Moveset")
+    local localChar = LocalPlayer.Character
+    if not localChar then return nil end
+    local attr = localChar:GetAttribute("Moveset")
     if attr then return attr end
-    local obj = LocalChar:FindFirstChild("Moveset")
+    local obj = localChar:FindFirstChild("Moveset")
     if not obj then return nil end
-    return obj:IsA("StringValue") and obj.Value or obj.Name
+    if obj:IsA("StringValue") then return obj.Value end
+    return obj.Name
 end
 
---// Shared release helper (kills the duplicated Stopped/timeout blocks) --------
-local function ReleaseOn(tracker, track, timeout)
-    local conn
-    conn = track.Stopped:Once(function()
-        if tracker[track] then tracker[track] = nil FireBlockDeactivated() end
-    end)
-    tinsert(ActiveConnections, conn)
-    task.delay(timeout or 5, function()
-        if tracker[track] then tracker[track] = nil FireBlockDeactivated() end
-    end)
+local function IsProjectileFacingUs(targetRoot, localRoot)
+    local directionToUs = (localRoot.Position - targetRoot.Position).Unit
+    return targetRoot.CFrame.LookVector:Dot(directionToUs) >= Options.ProjectileFacingThreshold.Value
 end
 
---// Projectile block ----------------------------------------------------------
-local function HandleProjectileAnimationPlay(character, track)
-    if not tog("ProjectileBlock") then return end
-    local anim = track and track.Animation
+--// Projectile auto-block
+local function HandleProjectileAnimationPlay(character, animationTrack)
+    if not Toggles.ProjectileBlock.Value then return end
+    if not animationTrack then return end
+    local anim = animationTrack.Animation
     if not anim then return end
 
-    local rawId = RawId(anim.AnimationId)
-    if tog("DebugMode") then
-        print("[XREZT] Projectile raw:", rawId, "inList:", rawId and ProjectileAnimations[rawId] or false)
+    local rawId = string_match(anim.AnimationId, "%d+")
+    if Toggles.DebugMode.Value then
+        print("[XREZT DEBUG] Projectile - Raw: " .. tostring(rawId) ..
+              " InList: " .. tostring(rawId and ProjectileAnimations[rawId] or false))
     end
     if not rawId or not ProjectileAnimations[rawId] then return end
+    if ActiveProjectileTracks[animationTrack] then return end
     if Players:GetPlayerFromCharacter(character) == LocalPlayer then return end
-    if IsIncapacitated(LocalChar) or not LocalRoot then return end
+    if IsLocalPlayerIncapacitated() then return end
 
+    local localChar = LocalPlayer.Character
+    if not localChar then return end
+    local localRoot = localChar:FindFirstChild("HumanoidRootPart")
     local targetRoot = character:FindFirstChild("HumanoidRootPart")
-    if not targetRoot then return end
+    if not localRoot or not targetRoot then return end
+    if (localRoot.Position - targetRoot.Position).Magnitude > Options.ProjectileRange.Value then return end
+    if Toggles.ProjectileFacingCheck.Value and not IsProjectileFacingUs(targetRoot, localRoot) then return end
 
-    local delta = targetRoot.Position - LocalRoot.Position
-    local range = opt("ProjectileRange", 100)
-    if delta.Magnitude > range then return end
-
-    if tog("ProjectileFacingCheck") then
-        local dot = targetRoot.CFrame.LookVector:Dot(-delta.Unit)
-        if dot < opt("ProjectileFacingThreshold", 0.5) then return end
-    end
-
-    if ActiveProjectileTracks[track] then return end
-    ActiveProjectileTracks[track] = true
+    ActiveProjectileTracks[animationTrack] = true
     FireBlockActivated()
-    ReleaseOn(ActiveProjectileTracks, track, 5)
+
+    -- :Once self-disconnects, so it must NOT be appended to ActiveConnections.
+    animationTrack.Stopped:Once(function()
+        if ActiveProjectileTracks[animationTrack] then
+            ActiveProjectileTracks[animationTrack] = nil
+            FireBlockDeactivated()
+        end
+    end)
+
+    task.delay(5, function()
+        if ActiveProjectileTracks[animationTrack] then
+            ActiveProjectileTracks[animationTrack] = nil
+            FireBlockDeactivated()
+        end
+    end)
 end
 
---// Standard M1/attack block ---------------------------------------------------
-local function HandleStandardAnimationPlay(character, track)
-    if not tog("AutoBlockEnabled") then return end
-    local anim = track and track.Animation
+--// Standard auto-block (cheap checks first, attacking check last)
+local function HandleStandardAnimationPlay(character, animationTrack)
+    if not Toggles.AutoBlockEnabled.Value then return end
+    if not animationTrack then return end
+    local anim = animationTrack.Animation
     if not anim then return end
+    if ActiveBlockingTracks[animationTrack] then return end
 
-    local rawId = RawId(anim.AnimationId)
+    local animationName = anim.Name
+    local rawId = string_match(anim.AnimationId, "%d+")
     if rawId and ProjectileAnimations[rawId] then return end
-
-    local animName = anim.Name
-    if IsMovementName(animName) then return end
-    if ExclusionSet[animName] then return end
+    if IsMovementName(animationName) then return end
+    if table.find(AnimationExclusionList, animationName) then return end
     if Players:GetPlayerFromCharacter(character) == LocalPlayer then return end
-    if not tog("BlockWhileAttacking") and IsLocalPlayerAttacking() then return end
-    if IsIncapacitated(LocalChar) or IsIncapacitated(character) then return end
-    if not LocalRoot then return end
+    if character:GetAttribute("Dead") then return end
 
+    local ragdollVal = character:GetAttribute("Ragdoll")
+    if ragdollVal and ragdollVal > 0 then return end
+    if IsLocalPlayerIncapacitated() then return end
+
+    local localChar = LocalPlayer.Character
+    if not localChar then return end
+    local localRoot = localChar:FindFirstChild("HumanoidRootPart")
     local targetRoot = character:FindFirstChild("HumanoidRootPart")
-    if not targetRoot then return end
+    if not localRoot or not targetRoot then return end
+    if (localRoot.Position - targetRoot.Position).Magnitude > Options.DetectionRange.Value then return end
 
-    local delta = targetRoot.Position - LocalRoot.Position
-    if delta.Magnitude > opt("DetectionRange", 25) then return end
-
-    if tog("FacingCheckEnabled") then
-        local dot = targetRoot.CFrame.LookVector:Dot(-delta.Unit)
-        if dot < opt("FacingAngleThreshold", 0.5) then return end
+    if Toggles.FacingCheckEnabled.Value then
+        local directionToUs = (localRoot.Position - targetRoot.Position).Unit
+        if targetRoot.CFrame.LookVector:Dot(directionToUs) < Options.FacingAngleThreshold.Value then return end
     end
-    if IsEnemyFeinting(character) then return end
-    if ActiveBlockingTracks[track] then return end
 
-    ActiveBlockingTracks[track] = true
+    if IsEnemyFeinting(character) then return end
+    -- Most expensive check (allocates a track table) runs last.
+    if not Toggles.BlockWhileAttacking.Value and IsLocalPlayerAttacking() then return end
+
+    ActiveBlockingTracks[animationTrack] = true
     FireBlockActivated()
 
-    if tog("BlockForAnimation") then
-        ReleaseOn(ActiveBlockingTracks, track, 5)
-    elseif tog("BlockForDuration") then
-        task.delay(opt("BlockDuration", 0.5), function()
-            if ActiveBlockingTracks[track] then
-                ActiveBlockingTracks[track] = nil
+    if Toggles.BlockForAnimation.Value then
+        animationTrack.Stopped:Once(function()
+            if ActiveBlockingTracks[animationTrack] then
+                ActiveBlockingTracks[animationTrack] = nil
+                FireBlockDeactivated()
+            end
+        end)
+        task.delay(5, function()
+            if ActiveBlockingTracks[animationTrack] then
+                ActiveBlockingTracks[animationTrack] = nil
+                FireBlockDeactivated()
+            end
+        end)
+    elseif Toggles.BlockForDuration.Value then
+        task.delay(Options.BlockDuration.Value, function()
+            if ActiveBlockingTracks[animationTrack] then
+                ActiveBlockingTracks[animationTrack] = nil
                 FireBlockDeactivated()
             end
         end)
     end
 end
 
---// Auto counter ----------------------------------------------------------------
-local function fireManjiKickService()
-    if not tog("AutoCounterEnabled") then return end
-    local moveset = LocalChar and LocalChar:FindFirstChild("Moveset")
-    local move = moveset and moveset:FindFirstChild("Manji Kick")
-    if move then FireRemote("ManjiKickService", "Activated", move) end
-end
+--// BFC curve glide (assigned, not re-declared, so the hook above sees it)
+function startCurveGlide()
+    local mode = Options.BfcDashMode and Options.BfcDashMode.Value or "Blatant"
+    if mode == "Legit" then
+        if startLegitCurveGlide then startLegitCurveGlide() end
+        return
+    end
+    if not getNearestTarget then return end
+    local target = getNearestTarget()
+    if not target then 
