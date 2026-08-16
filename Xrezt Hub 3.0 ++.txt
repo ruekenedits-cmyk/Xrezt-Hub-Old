@@ -1,6 +1,9 @@
 -- Xrezt Hub | Obsidian | optimized merge
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"))()
 
+local Toggles = Library.Toggles
+local Options = Library.Options
+
 local Players           = game:GetService("Players")
 local RunService        = game:GetService("RunService")
 local UserInputService  = game:GetService("UserInputService")
@@ -371,11 +374,6 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
             end
         end)
 
-        if targetRoot then
-            task.spawn(function()
-                if targetRoot.Parent then performCurvedDash(targetRoot) end
-            end)
-        end
         return result
     end
 
@@ -484,7 +482,7 @@ end)
 
 SaveManager:LoadAutoloadConfig()
 
-====== Auto Tab ======
+-- ====== Auto Tab ======
 
 local AutoTab     = Window:AddTab("Auto", "Zap")
 
@@ -638,10 +636,10 @@ XreztACBypassGroup:AddToggle('ACBypassEnabled', {
 
                 task.spawn(function()
                     while _ScreenGui.Parent do
+                        local now = os.clock()
                         for _, s in ipairs(_stars) do
-                            local t = os.clock() + s.phase
-                            local alpha = (math.sin(t * 1.5) + 1) / 2
-                            s.frame.BackgroundTransparency = 0.35 + (alpha * 0.5)
+                            local alpha = (math.sin((now + s.phase) * 1.5) + 1) * 0.5
+                            s.frame.BackgroundTransparency = 0.35 + alpha * 0.5
                         end
                         task.wait(0.1)
                     end
@@ -735,6 +733,12 @@ XreztACBypassGroup:AddToggle('ACBypassEnabled', {
                     outTween:Play()
                     outTween.Completed:Connect(function()
                         _ScreenGui:Destroy()
-                        Toggles.ACBypassEnabled:SetValue(false)
+                        local t = Toggles.ACBypassEnabled
+                        if t then t:SetValue(false) end
                     end)
+
                 end)
+            end)
+        end
+    end,
+})
