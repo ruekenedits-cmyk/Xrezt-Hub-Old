@@ -1,485 +1,414 @@
--- Xrezt Hub | Obsidian | optimized merge
-local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"))()
+--// Xrezt Hub | JJS Premium — optimized core
+local Library      = loadstring(game:HttpGet('https://raw.githubusercontent.com/deividcomsono/Obsidian/main/Library.lua'))()
+local ThemeManager = loadstring(game:HttpGet('https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/ThemeManager.lua'))()
+local SaveManager  = loadstring(game:HttpGet('https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/SaveManager.lua'))()
 
-local Players           = game:GetService("Players")
-local RunService        = game:GetService("RunService")
-local UserInputService  = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService      = game:GetService("TweenService")
+local Options, Toggles = Library.Options, Library.Toggles
+Library.ForceCheckbox = false
+Library.ShowToggleFrameInKeybinds = true
+
+local Window = Library:CreateWindow({
+    Title = 'Xrezt Hub - JJS Premium',
+    Footer = 'Xrezt Hub | V1 - Premium',
+    NotifySide = 'Right',
+    ShowCustomCursor = true,
+})
+
+local MainTab   = Window:AddTab('Main', 'shield')
+local VisualTab = Window:AddTab('Visual', 'eye')
+local MiscTab   = Window:AddTab('Misc', 'box')
+local AutoTab   = Window:AddTab('Auto', 'zap')
+local ConfigTab = Window:AddTab('Settings', 'settings')
+
+--// Services
+local Players           = game:GetService('Players')
+local RunService        = game:GetService('RunService')
+local ReplicatedStorage = game:GetService('ReplicatedStorage')
+local Stats             = game:GetService('Stats')
 
 local LocalPlayer = Players.LocalPlayer
 local Camera      = workspace.CurrentCamera
 
--- ==========================================
--- LOADING
--- ==========================================
-local Loading = Library:CreateLoading({ Title = "Xrezt Hub", Icon = 95816097006870, TotalSteps = 4 })
-Loading:SetMessage("Initializing...")
-Loading:SetDescription("Waiting for game to load...")
-task.wait(0.5)
-Loading:SetCurrentStep(1); Loading:SetDescription("Loading configuration..."); task.wait(0.5)
-Loading:SetCurrentStep(2); Loading:ShowSidebarPage(true)
-Loading.Sidebar:AddLabel("User: " .. LocalPlayer.Name)
-Loading.Sidebar:AddLabel("Version: v2.5")
-task.wait(0.5)
-Loading:SetCurrentStep(3); Loading:SetDescription("Ready to start!"); task.wait(0.5)
-Loading:SetCurrentStep(4); Loading:Continue()
+--// Locals (hot path)
+local abs, max, find, lower, match = math.abs, math.max, string.find, string.lower, string.match
+local tinsert, tfind, tremove, tclear = table.insert, table.find, table.remove, table.clear
 
--- ==========================================
--- WINDOW
--- ==========================================
-local Window = Library:CreateWindow({ Title = "Xrezt Hub", Footer = "version: 2.5", NotifySide = "Right" })
-local MainTab     = Window:AddTab("Main", "Home")
-local SettingsTab = Window:AddTab("UI Settings", "settings")
+--// State
+local ActiveConnections     = {}
+local ActiveBlockingTracks  = {}
+local ActiveProjectileTracks= {}
+local AlwaysDownslamActive  = false
+local AllAnimationNames     = { "Loading animations..." }
+local AnimationExclusionList= {}
+local ExclusionSet          = {}   -- O(1) exclusion lookups
+local dashInProgress        = false
 
-local ThemeManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/ThemeManager.lua"))()
-ThemeManager:SetLibrary(Library); ThemeManager:SetFolder("XreztHub")
-ThemeManager:ApplyToTab(SettingsTab); ThemeManager:LoadDefault()
+_G.BfcOrbitAngle = _G.BfcOrbitAngle or 0
 
-local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/SaveManager.lua"))()
-SaveManager:SetLibrary(Library); SaveManager:IgnoreThemeSettings()
-SaveManager:SetIgnoreIndexes({ "MenuKeybind" }); SaveManager:SetFolder("XreztHub")
-SaveManager:BuildConfigSection(SettingsTab)
-
-local LeftGroupBox  = MainTab:AddLeftGroupbox("Combat", "wrench")
-local RightGroupBox = MainTab:AddRightGroupbox("Todo Perfect Swap")
-local DashGroupBox  = MainTab:AddLeftGroupbox("Divergent Dash", "zap")
-
--- ==========================================
--- CHARACTER CACHE
--- ==========================================
-local MyChar, MyRoot, MyHum, MyAnimator
-
-local function bindCharacter(char)
-    MyChar = char
-    MyRoot = char:WaitForChild("HumanoidRootPart", 5)
-    MyHum  = char:WaitForChild("Humanoid", 5)
-    MyAnimator = MyHum and MyHum:FindFirstChildOfClass("Animator")
+--// Fast helpers ------------------------------------------------------------
+local function tog(name)  local t = Toggles[name]  return t and t.Value end
+local function opt(name, default)
+    local o = Options[name]
+    if o == nil then return default end
+    return o.Value
 end
-if LocalPlayer.Character then bindCharacter(LocalPlayer.Character) end
 
--- ==========================================
--- REMOTES
--- ==========================================
-local Services = ReplicatedStorage:WaitForChild("Knit"):WaitForChild("Knit"):WaitForChild("Services")
+--// Movement keyword matching: single cached scan instead of 26 finds/anim
+local MovementStateKeywords = {
+    "run","chase","down","fall","ragdoll","idle","walk","jump","dash","climb",
+    "getup","land","sprint","movement","turn","halt","hover","sleep","emote",
+    "spawn","dance","wave","sit","block"
+}
+local movementCache = setmetatable({}, { __mode = "k" })
+local function IsMovementName(name)
+    local cached = movementCache[name]
+    if cached ~= nil then return cached end
+    local l = lower(name)
+    local hit = false
+    for i = 1, #MovementStateKeywords do
+        if find(l, MovementStateKeywords[i], 1, true) then hit = true break end
+    end
+    movementCache[name] = hit
+    return hit
+end
 
-local DivergentEvent = Services.DivergentFistService.RE.Activated
-local NanamiRE       = Services.NanamiService.RE
-local NanamiEffects  = NanamiRE.Effects
-local NanamiRight    = NanamiRE.RightActivated
-local TodoRE         = Services:WaitForChild("TodoService"):WaitForChild("RE")
-local TodoRight      = TodoRE:WaitForChild("RightActivated")
-local TodoActivated  = TodoRE:WaitForChild("Activated")
-
-local ReturnSkill
-pcall(function() ReturnSkill = Services.ItadoriService.RE.RightActivated end)
-
--- ==========================================
--- LOCK-ON
--- ==========================================
-local LockOn = {
-    Enabled = false, Target = nil, TargetRoot = nil,
-    UseCamera = true, UseCharacter = true,
-    MaxDistance = 60, CameraOffset = 1.75, LerpFactor = 0.9,
+--// Animation id sets (unchanged data, kept as hash lookups)
+local ProjectileAnimations = {
+    ["116432619539029"]=true,["17324258817"]=true,["127851700400958"]=true,["16705392699"]=true,
+    ["137654778575373"]=true,["137865634124104"]=true,["72548435296350"]=true,["725484352963"]=true,
+    ["84547415708554"]=true,["110978068388232"]=true,["104749346956269"]=true,["124901309160375"]=true,
+    ["89092734635186"]=true,["110146909061402"]=true,["105376952884290"]=true,["123414935051274"]=true,
+    ["108636011034323"]=true,["132653290201368"]=true,["121984128639453"]=true,["101617544363219"]=true,
+    ["75736902190737"]=true,["118861398234801"]=true,["132725601768618"]=true,["77200218033775"]=true,
+    ["82541714192027"]=true,["72063002791216"]=true,["79619765411660"]=true,["81112033595734"]=true,
+    ["81630213087988"]=true,["105077924973072"]=true,["95295463826732"]=true,["124862357369335"]=true,
+    ["115234621584704"]=true,["84039122607068"]=true,["127171275866632"]=true,["100446064103831"]=true,
+    ["94720627091769"]=true,["111720035828971"]=true,["89652378115594"]=true,["124340599144108"]=true,
+    ["71186534081075"]=true,["129132347098646"]=true,["129678103897608"]=true,["134777193523837"]=true,
+    ["79538775132859"]=true,["85783365130041"]=true,["84827960380871"]=true,["72933571933445"]=true,
+    ["103013818601982"]=true,["97868312130612"]=true,["94588892125071"]=true,["140588454098230"]=true,
+    ["138826758216894"]=true,["105287938257399"]=true,["96185406489877"]=true,["75337033003776"]=true,
+    ["138489871864252"]=true,["119042572747325"]=true,["71784337627181"]=true,["125120382787311"]=true,
+    ["96327114254575"]=true,["107029561762376"]=true,["117831239064143"]=true,["133936641185614"]=true,
+    ["122573730331631"]=true,["82400997593751"]=true,["118634493886688"]=true,["132855702748568"]=true,
+    ["99205259396653"]=true,["108027796023968"]=true,["85068785050521"]=true,["79086910454958"]=true,
+    ["107825127494342"]=true,["97504088532041"]=true,["106474043944206"]=true,["91990544700842"]=true,
+    ["79271374075726"]=true,["139833047658617"]=true,["125689391910002"]=true,["84080901810314"]=true,
+    ["140597320237985"]=true,["99451940496871"]=true,["130284226842903"]=true,
 }
 
-local TargetGroup = workspace:FindFirstChild("Characters") or workspace
-local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
-
-local Highlight = Instance.new("Highlight")
-Highlight.Name = "LockOnFullBody"
-Highlight.FillColor = Color3.fromRGB(255, 0, 0)
-Highlight.FillTransparency = 0.85
-Highlight.OutlineColor = Color3.fromRGB(0, 255, 255)
-Highlight.Enabled = false
-Highlight.Parent = PlayerGui
-
-local LockToggle, disableLockOn
-local PHYSICS_STATE  = Enum.HumanoidStateType.Physics
-local PLATFORM_STATE = Enum.HumanoidStateType.PlatformStanding
-
-local function isValidTarget(char)
-    if char == MyChar or not char.Parent then return false end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 then return false end
-    if char:GetAttribute("Dead") == true then return false end
-    return char:FindFirstChild("HumanoidRootPart") ~= nil
-end
-
--- shared nearest-target finder (used by lock-on AND dash) — no GetDescendants
-local function getClosestCharacter(maxDist)
-    if not MyRoot then return nil end
-    local myPos = MyRoot.Position
-    local best, bestSq = nil, (maxDist or LockOn.MaxDistance) ^ 2
-    for _, obj in ipairs(TargetGroup:GetChildren()) do
-        if obj:IsA("Model") and isValidTarget(obj) then
-            local d = myPos - obj.HumanoidRootPart.Position
-            local sq = d.X * d.X + d.Y * d.Y + d.Z * d.Z
-            if sq < bestSq then bestSq, best = sq, obj end
-        end
-    end
-    return best
-end
-
-local function onRenderStep()
-    local target, tRoot = LockOn.Target, LockOn.TargetRoot
-    if not tRoot or not tRoot.Parent or not target.Parent or not MyRoot or not MyHum then
-        disableLockOn(true); return
-    end
-    if LockOn.UseCamera then
-        local camCF = Camera.CFrame
-        local aim = tRoot.Position + camCF.RightVector * LockOn.CameraOffset
-        Camera.CFrame = camCF:Lerp(CFrame.lookAt(camCF.Position, aim), LockOn.LerpFactor)
-    end
-    if LockOn.UseCharacter then
-        local state = MyHum:GetState()
-        if state == PHYSICS_STATE or state == PLATFORM_STATE then
-            if not MyHum.AutoRotate then MyHum.AutoRotate = true end
-        else
-            if MyHum.AutoRotate then MyHum.AutoRotate = false end
-            local myPos, tp = MyRoot.Position, tRoot.Position
-            MyRoot.CFrame = CFrame.lookAt(myPos, Vector3.new(tp.X, myPos.Y, tp.Z))
-        end
-    end
-end
-
-local function enableLockOn(target)
-    local root = target:FindFirstChild("HumanoidRootPart")
-    if not root then return false end
-    LockOn.Target, LockOn.TargetRoot, LockOn.Enabled = target, root, true
-    Highlight.Adornee = target
-    Highlight.Enabled = true
-    if LockOn.UseCamera then
-        Camera.CameraType = Enum.CameraType.Track
-        UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-    end
-    if MyHum and LockOn.UseCharacter then MyHum.AutoRotate = false end
-    RunService:BindToRenderStep("LockOnSystemRender", Enum.RenderPriority.Camera.Value + 1, onRenderStep)
-    return true
-end
-
-function disableLockOn(syncToggle)
-    if not LockOn.Enabled then
-        if syncToggle and LockToggle and LockToggle.Value then LockToggle:SetValue(false) end
-        return
-    end
-    RunService:UnbindFromRenderStep("LockOnSystemRender")
-    LockOn.Enabled, LockOn.Target, LockOn.TargetRoot = false, nil, nil
-    Highlight.Enabled = false
-    Highlight.Adornee = nil
-    Camera.CameraType = Enum.CameraType.Custom
-    UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-    if MyHum then MyHum.AutoRotate = true end
-    if syncToggle and LockToggle and LockToggle.Value then LockToggle:SetValue(false) end
-end
-
-LockToggle = LeftGroupBox:AddToggle("LockOnTarget", {
-    Text = "Lock On (Nearest)",
-    Tooltip = "Locks camera + character rotation onto the closest valid target",
-    Default = false,
-    Callback = function(Value)
-        if Value then
-            local closest = getClosestCharacter()
-            if not closest or not enableLockOn(closest) then LockToggle:SetValue(false) end
-        else
-            disableLockOn(false)
-        end
-    end,
-})
-LockToggle:AddKeyPicker("LockOnKey", { Default = "Q", SyncToggleState = true, Mode = "Toggle", Text = "Lock On" })
-
--- ==========================================
--- DIVERGENT DASH CONFIG
--- ==========================================
-local CONFIG = {
-    BehindOffset = 5.5, AlreadyBehindTolerance = 3.5,
-    FireDelay = 0.37, DashSpeed = 79, ArcSegments = 5, SideWidth = 0.65,
-    TrailLifetime = 0.35,
-    DashAnimLeft  = "rbxassetid://117223862448096",
-    DashAnimRight = "rbxassetid://75203303352791",
-    AttackAnimId  = "rbxassetid://100962226150441",
-    FacingDotThreshold = -0.6, RetryDelay = 0.04, RetryFire = true,
-    MaxRange = 90,
+local AnimationTriggers = {
+    ["rbxassetid://100962226150441"] = 0.19,
+    ["rbxassetid://95852624447551"]  = 0.19,
+    ["rbxassetid://74145636023952"]  = 0.19,
+    ["rbxassetid://72475960800126"]  = 0.20,
 }
+local StraightAnimations = { ["rbxassetid://123171106092050"] = true }
 
-local DashEnabled = false
-
--- cached animation objects + tracks (loaded once, no reload per dash)
-local animCache = {}
-local function getTrack(key, id)
-    if not MyAnimator then return nil end
-    local entry = animCache[key]
-    if not entry or entry.animator ~= MyAnimator then
-        local anim = Instance.new("Animation")
-        anim.AnimationId = id
-        entry = { animator = MyAnimator, track = MyAnimator:LoadAnimation(anim) }
-        entry.track.Priority = Enum.AnimationPriority.Action
-        animCache[key] = entry
+--// Cache anim id -> raw digits, avoids a string.match every AnimationPlayed
+local rawIdCache = {}
+local function RawId(animationId)
+    local c = rawIdCache[animationId]
+    if c == nil then
+        c = match(animationId, "%d+") or false
+        rawIdCache[animationId] = c
     end
-    return entry.track
+    return c or nil
 end
 
-local function playDash(direction, duration)
-    local track = getTrack(direction, direction == "Left" and CONFIG.DashAnimLeft or CONFIG.DashAnimRight)
-    if not track then return nil end
-    track:Play()
-    task.delay(duration + 0.05, function() if track.IsPlaying then track:Stop(0.15) end end)
-    return track
+--// Knit service cache -------------------------------------------------------
+local cachedServices, remoteCache = nil, {}
+local function GetKnitServices()
+    if cachedServices and cachedServices.Parent then return cachedServices end
+    local knit = ReplicatedStorage:FindFirstChild("Knit")
+    local inner = knit and knit:FindFirstChild("Knit")
+    cachedServices = inner and inner:FindFirstChild("Services") or nil
+    return cachedServices
 end
 
-local function playAttack()
-    local track = getTrack("Attack", CONFIG.AttackAnimId)
-    if not track then return end
-    track:Play()
-    task.delay(1.113, function() if track.IsPlaying then track:Stop() end end)
+-- one lookup per (service, remote) pair, then cached forever
+local function GetRemote(serviceName, remoteName)
+    local key = serviceName .. "/" .. remoteName
+    local r = remoteCache[key]
+    if r and r.Parent then return r end
+    local services = GetKnitServices()
+    local svc = services and services:FindFirstChild(serviceName)
+    local re  = svc and svc:FindFirstChild("RE")
+    r = re and re:FindFirstChild(remoteName) or nil
+    remoteCache[key] = r
+    return r
 end
 
--- trail parts reused instead of recreated
-local trailA0, trailA1, trailObj
-local function createTrail(root)
-    if not trailObj or trailObj.Parent ~= root then
-        if trailObj then trailObj:Destroy() end
-        if trailA0 then trailA0:Destroy() end
-        if trailA1 then trailA1:Destroy() end
-        trailA0 = Instance.new("Attachment", root)
-        trailA1 = Instance.new("Attachment", root)
-        trailA1.Position = Vector3.new(0, 2, 0)
-        trailObj = Instance.new("Trail", root)
-        trailObj.Attachment0, trailObj.Attachment1 = trailA0, trailA1
-        trailObj.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255))
-        trailObj.Transparency = NumberSequence.new({
-            NumberSequenceKeypoint.new(0, 0.4), NumberSequenceKeypoint.new(1, 1),
-        })
-        trailObj.Lifetime, trailObj.MinLength, trailObj.FaceCamera = CONFIG.TrailLifetime, 0, true
+local function FireRemote(serviceName, remoteName, ...)
+    local remote = GetRemote(serviceName, remoteName)
+    if not remote then return false end
+    local ok = pcall(remote.FireServer, remote, ...)
+    return ok
+end
+
+--// Ping sampler (event-free, low cost)
+local networkPing = 0.06
+task.spawn(function()
+    local net = Stats.Network
+    while task.wait(2) do
+        local ok, item = pcall(function() return net.ServerStatsItem["Data Ping"] end)
+        if ok and item then
+            local n = tonumber(match(item:GetValueString(), "%d+"))
+            if n then networkPing = n / 1000 end
+        end
     end
-    trailObj.Enabled = true
-    task.delay(CONFIG.TrailLifetime + 0.1, function()
-        if trailObj then trailObj.Enabled = false end
+end)
+
+--// Character refs cached on respawn instead of FindFirstChild per frame ------
+local LocalChar, LocalRoot, LocalHum
+local function BindCharacter(char)
+    LocalChar = char
+    LocalRoot = char and char:WaitForChild("HumanoidRootPart", 5) or nil
+    LocalHum  = char and char:FindFirstChildOfClass("Humanoid") or nil
+end
+BindCharacter(LocalPlayer.Character)
+tinsert(ActiveConnections, LocalPlayer.CharacterAdded:Connect(BindCharacter))
+tinsert(ActiveConnections, LocalPlayer.CharacterRemoving:Connect(function()
+    LocalChar, LocalRoot, LocalHum = nil, nil, nil
+end))
+
+--// Mahito auto-blackflash ----------------------------------------------------
+local MAHITO_BF_ANIM = "72475960800126"
+local MahitoConnection
+local function SetupMahitoCharacter(character)
+    if MahitoConnection then MahitoConnection:Disconnect() MahitoConnection = nil end
+    if not character then return end
+    local hum = character:WaitForChild("Humanoid", 5)
+    local animator = hum and hum:WaitForChild("Animator", 5)
+    if not animator then return end
+
+    MahitoConnection = animator.AnimationPlayed:Connect(function(track)
+        if not tog("AutoMahitoBlackflash") then return end
+        local anim = track.Animation
+        if not anim or not find(anim.AnimationId, MAHITO_BF_ANIM, 1, true) then return end
+        task.delay(0.2, function()
+            local moveset = character:FindFirstChild("Moveset")
+            local move = moveset and moveset:FindFirstChild("Focus Strike")
+            if move then FireRemote("FocusStrikeService", "Activated", move) end
+        end)
     end)
+    tinsert(ActiveConnections, MahitoConnection)
 end
 
-local function isTargetFacingAway(targetRoot)
-    if not MyRoot or not targetRoot or not targetRoot.Parent then return false end
-    local toPlayer = MyRoot.Position - targetRoot.Position
-    if toPlayer.Magnitude < 0.01 then return false end
-    return targetRoot.CFrame.LookVector:Dot(toPlayer.Unit) < CONFIG.FacingDotThreshold
-end
-
-local ARC = {
-    { 0.10, 0.50 }, { 0.30, 0.80 }, { 0.55, 0.70 }, { 0.75, 0.40 }, { 1.00, 0 },
-}
-
-local function performCurvedDash(targetRoot)
-    if not MyRoot then return end
-    local myPos   = MyRoot.Position
-    local destPos = (targetRoot.CFrame * CFrame.new(0, 0, CONFIG.BehindOffset)).Position
-
-    if (myPos - destPos).Magnitude < CONFIG.AlreadyBehindTolerance then
-        playAttack(); return
-    end
-
-    local delta = destPos - myPos
-    local dist  = delta.Magnitude
-    if dist < 0.5 then return end
-
-    local dir  = delta / dist
-    local side = dir:Cross(Vector3.yAxis).Unit
-    local isLeft = math.random(1, 2) == 2
-    if isLeft then side = -side end
-
-    local waypoints, n = {}, math.min(CONFIG.ArcSegments, #ARC)
-    for i = 1, n do
-        waypoints[i] = myPos + dir * dist * ARC[i][1] + side * dist * (CONFIG.SideWidth * ARC[i][2])
-    end
-
-    local totalTime = math.max(dist / CONFIG.DashSpeed, 0.08)
-    local segTime   = totalTime / n
-
-    createTrail(MyRoot)
-    local dashTrack = playDash(isLeft and "Left" or "Right", totalTime)
-
-    local info = TweenInfo.new(segTime, Enum.EasingStyle.Linear)
-    for i = 1, n do
-        local wp = waypoints[i]
-        local lookDir = (i < n) and (waypoints[i + 1] - wp).Unit or (targetRoot.Position - wp).Unit
-        TweenService:Create(MyRoot, info, { CFrame = CFrame.new(wp, wp + lookDir) }):Play()
-        task.wait(segTime)
-    end
-
-    MyRoot.CFrame = CFrame.lookAt(destPos, targetRoot.Position)
-    if dashTrack and dashTrack.IsPlaying then dashTrack:Stop(0.1) end
-    playAttack()
-end
-
--- ==========================================
--- FLAGS
--- ==========================================
-local SwapEnabled = false
-local SWAP_DELAY  = 0.52
-local COOLDOWN    = 0.15
-local canFire     = true
-
-local dashCooling, dashRetrying = false, false
-
--- ==========================================
--- SINGLE MERGED NAMECALL HOOK
--- ==========================================
+--// Namecall hook: single early-out, no table alloc on the common path --------
 local oldNamecall
-oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-    -- fast path
-    if (self ~= DivergentEvent and self ~= TodoRight)
-        or (not DashEnabled and not SwapEnabled)
-        or getnamecallmethod() ~= "FireServer" then
+oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+    if getnamecallmethod() ~= "FireServer" then
         return oldNamecall(self, ...)
     end
 
-    if self == DivergentEvent then
-        if not DashEnabled or dashRetrying or dashCooling or checkcaller() then
-            return oldNamecall(self, ...)
+    local name = rawget(self, "Name") or self.Name
+    if name ~= "Activated" then return oldNamecall(self, ...) end
+
+    local re = self.Parent
+    local service = re and re.Parent
+    if not service or re.Name ~= "RE" then return oldNamecall(self, ...) end
+
+    -- Always Downslam: rewrite arg 1 only when it's the equipped moveset
+    if AlwaysDownslamActive and service.Name == (LocalPlayer:GetAttribute("Moveset") or "") .. "Service" then
+        local args = { ... }
+        if args[1] == false then
+            args[1] = "Down"
+            return oldNamecall(self, table.unpack(args))
         end
-        dashCooling = true
-
-        local result = oldNamecall(self, ...)
-        local args   = table.pack(...)
-        local target = getClosestCharacter(CONFIG.MaxRange)
-        local targetRoot = target and target.HumanoidRootPart
-
-        task.delay(CONFIG.FireDelay, function()
-            if targetRoot and targetRoot.Parent and not isTargetFacingAway(targetRoot) then
-                if ReturnSkill then pcall(function() ReturnSkill:FireServer() end) end
-                task.spawn(function()
-                    task.wait(CONFIG.RetryDelay)
-                    if not targetRoot.Parent then
-                        task.defer(function() dashCooling = false end); return
-                    end
-                    performCurvedDash(targetRoot)
-                    local shouldRetryFire = (_G.retryfire ~= nil) and _G.retryfire or CONFIG.RetryFire
-                    if isTargetFacingAway(targetRoot) and shouldRetryFire then
-                        dashRetrying = true
-                        pcall(function() DivergentEvent:FireServer(table.unpack(args, 1, args.n)) end)
-                        task.wait(CONFIG.FireDelay)
-                        pcall(function() DivergentEvent:FireServer(table.unpack(args, 1, args.n)) end)
-                        dashRetrying = false
-                    end
-                    task.defer(function() dashCooling = false end)
-                end)
-            else
-                dashRetrying = true
-                pcall(function() DivergentEvent:FireServer(table.unpack(args, 1, args.n)) end)
-                dashRetrying = false
-                task.defer(function() dashCooling = false end)
-            end
-        end)
-
-        if targetRoot then
-            task.spawn(function()
-                if targetRoot.Parent then performCurvedDash(targetRoot) end
-            end)
-        end
-        return result
     end
 
-    -- self == TodoRight
-    local result = oldNamecall(self, ...)
-    if SwapEnabled and canFire and not checkcaller() then
-        canFire = false
-        task.delay(SWAP_DELAY, function()
-            TodoActivated:FireServer(false)
-            task.delay(COOLDOWN, function() canFire = true end)
+    -- BFC dash-behind
+    if service.Name == "DivergentFistService"
+        and not dashInProgress
+        and tog("BfcEnabled") and tog("BfcDashBehind") then
+        task.delay(0.08, function()
+            if startCurveGlide then startCurveGlide() end
         end)
     end
-    return result
-end))
 
--- ==========================================
--- DASH TOGGLES
--- ==========================================
-DashGroupBox:AddToggle("DivergentDash", {
-    Text = "Divergent Dash (Back Hit)",
-    Tooltip = "Curves behind the nearest enemy when you use Divergent Fist",
-    Default = false,
-    Callback = function(Value)
-        DashEnabled = Value
-        dashCooling, dashRetrying = false, false
-    end,
-})
-
-DashGroupBox:AddToggle("RetryFire", {
-    Text = "Retry Fire",
-    Default = CONFIG.RetryFire,
-    Callback = function(Value) CONFIG.RetryFire = Value; _G.retryfire = Value end,
-})
-
-DashGroupBox:AddSlider("DashSpeed", {
-    Text = "Dash Speed", Default = CONFIG.DashSpeed, Min = 40, Max = 140, Rounding = 0,
-    Callback = function(Value) CONFIG.DashSpeed = Value end,
-})
-
-DashGroupBox:AddSlider("FireDelay", {
-    Text = "Fire Delay", Default = CONFIG.FireDelay, Min = 0.10, Max = 0.80,
-    Rounding = 2, Suffix = "s",
-    Callback = function(Value) CONFIG.FireDelay = Value end,
-})
-
-DashGroupBox:AddSlider("BehindOffset", {
-    Text = "Behind Offset", Default = CONFIG.BehindOffset, Min = 2, Max = 10,
-    Rounding = 1,
-    Callback = function(Value) CONFIG.BehindOffset = Value end,
-})
-
--- ==========================================
--- AUTO NANAMI RATIO
--- ==========================================
-local effectConnection
-LeftGroupBox:AddToggle("AutoNanamiRatio", {
-    Text = "Auto Nanami Ratio",
-    Default = false,
-    Callback = function(Value)
-        if Value then
-            if effectConnection then return end
-            effectConnection = NanamiEffects.OnClientEvent:Connect(function(kind, plr, _, _, _, dur)
-                if kind ~= "SpawnRatio" or plr ~= LocalPlayer then return end
-                local delayTime = dur * 0.5676767676767677 - LocalPlayer:GetNetworkPing()
-                if delayTime > 0 then
-                    task.delay(delayTime, function() NanamiRight:FireServer() end)
-                else
-                    NanamiRight:FireServer()
-                end
-            end)
-        elseif effectConnection then
-            effectConnection:Disconnect(); effectConnection = nil
-        end
-    end,
-})
-
--- ==========================================
--- TODO PERFECT SWAP
--- ==========================================
-RightGroupBox:AddToggle("PerfectSwap", {
-    Text = "Perfect Swap",
-    Tooltip = "Auto-fires Activated after a right-click swap",
-    Default = false,
-    Callback = function(Value) SwapEnabled = Value; canFire = true end,
-}):AddKeyPicker("PerfectSwapKey", {
-    Default = "R", SyncToggleState = true, Mode = "Toggle", Text = "Perfect Swap",
-})
-
-RightGroupBox:AddSlider("SwapDelay", {
-    Text = "Swap Delay", Default = SWAP_DELAY, Min = 0.30, Max = 0.90,
-    Rounding = 2, Suffix = "s",
-    Callback = function(Value) SWAP_DELAY = Value end,
-})
-
--- ==========================================
--- RESPAWN
--- ==========================================
-LocalPlayer.CharacterAdded:Connect(function(char)
-    disableLockOn(true)
-    bindCharacter(char)
-    canFire = true
-    dashCooling, dashRetrying = false, false
-    table.clear(animCache)
-    trailObj, trailA0, trailA1 = nil, nil, nil
+    return oldNamecall(self, ...)
 end)
 
-SaveManager:LoadAutoloadConfig()
+--// Block ref-counting --------------------------------------------------------
+local GlobalBlockCount = 0
+local function FireBlockActivated()
+    if GlobalBlockCount == 0 then FireRemote("BlockService", "Activated") end
+    GlobalBlockCount += 1
+end
+local function FireBlockDeactivated()
+    GlobalBlockCount = max(0, GlobalBlockCount - 1)
+    if GlobalBlockCount == 0 then FireRemote("BlockService", "Deactivated") end
+end
+local function ForceReleaseBlock()
+    GlobalBlockCount = 0
+    FireRemote("BlockService", "Deactivated")
+end
+
+--// State checks --------------------------------------------------------------
+local function IsLocalPlayerAttacking()
+    if not LocalHum then return false end
+    for _, track in ipairs(LocalHum:GetPlayingAnimationTracks()) do
+        if track.IsPlaying and not IsMovementName(track.Animation.Name) then return true end
+    end
+    return false
+end
+
+local function IsIncapacitated(char)
+    if not char then return true end
+    if char:GetAttribute("Dead") then return true end
+    local rag = char:GetAttribute("Ragdoll")
+    return (rag and rag > 0) or false
+end
+
+--// Dropdown registry ---------------------------------------------------------
+local knownAnimNames = {}
+local dropdownDirty = false
+local function RegisterTrackToDropdown(animationName)
+    if knownAnimNames[animationName] or IsMovementName(animationName) then return end
+    knownAnimNames[animationName] = true
+    if AllAnimationNames[1] == "Loading animations..." then tremove(AllAnimationNames, 1) end
+    tinsert(AllAnimationNames, animationName)
+    dropdownDirty = true
+end
+-- batched UI refresh (sorting/SetValues per animation was a real stutter source)
+task.spawn(function()
+    while task.wait(1) do
+        if dropdownDirty and Options.AnimationsList then
+            dropdownDirty = false
+            table.sort(AllAnimationNames)
+            Options.AnimationsList:SetValues(AllAnimationNames)
+        end
+    end
+end)
+
+local function RebuildExclusionSet()
+    tclear(ExclusionSet)
+    for _, n in ipairs(AnimationExclusionList) do ExclusionSet[n] = true end
+end
+
+--// Feint detection (cached per emitter) --------------------------------------
+local feintCache = setmetatable({}, { __mode = "k" })
+local function IsEnemyFeinting(character)
+    if not tog("AntiFeintEnabled") then return false end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    local feint = root and root:FindFirstChild("Feint")
+    local ring = feint and feint:FindFirstChild("Ring")
+    if not (ring and ring:IsA("ParticleEmitter")) then return false end
+
+    local cached = feintCache[ring]
+    if cached ~= nil then return cached end
+    local grey = false
+    for _, kp in ipairs(ring.Color.Keypoints) do
+        local v = kp.Value
+        if abs(v.R - v.G) < 0.05 and abs(v.G - v.B) < 0.05 then grey = true break end
+    end
+    feintCache[ring] = grey
+    return grey
+end
+
+local function GetCurrentMoveset()
+    if not LocalChar then return nil end
+    local attr = LocalChar:GetAttribute("Moveset")
+    if attr then return attr end
+    local obj = LocalChar:FindFirstChild("Moveset")
+    if not obj then return nil end
+    return obj:IsA("StringValue") and obj.Value or obj.Name
+end
+
+--// Shared release helper (kills the duplicated Stopped/timeout blocks) --------
+local function ReleaseOn(tracker, track, timeout)
+    local conn
+    conn = track.Stopped:Once(function()
+        if tracker[track] then tracker[track] = nil FireBlockDeactivated() end
+    end)
+    tinsert(ActiveConnections, conn)
+    task.delay(timeout or 5, function()
+        if tracker[track] then tracker[track] = nil FireBlockDeactivated() end
+    end)
+end
+
+--// Projectile block ----------------------------------------------------------
+local function HandleProjectileAnimationPlay(character, track)
+    if not tog("ProjectileBlock") then return end
+    local anim = track and track.Animation
+    if not anim then return end
+
+    local rawId = RawId(anim.AnimationId)
+    if tog("DebugMode") then
+        print("[XREZT] Projectile raw:", rawId, "inList:", rawId and ProjectileAnimations[rawId] or false)
+    end
+    if not rawId or not ProjectileAnimations[rawId] then return end
+    if Players:GetPlayerFromCharacter(character) == LocalPlayer then return end
+    if IsIncapacitated(LocalChar) or not LocalRoot then return end
+
+    local targetRoot = character:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then return end
+
+    local delta = targetRoot.Position - LocalRoot.Position
+    local range = opt("ProjectileRange", 100)
+    if delta.Magnitude > range then return end
+
+    if tog("ProjectileFacingCheck") then
+        local dot = targetRoot.CFrame.LookVector:Dot(-delta.Unit)
+        if dot < opt("ProjectileFacingThreshold", 0.5) then return end
+    end
+
+    if ActiveProjectileTracks[track] then return end
+    ActiveProjectileTracks[track] = true
+    FireBlockActivated()
+    ReleaseOn(ActiveProjectileTracks, track, 5)
+end
+
+--// Standard M1/attack block ---------------------------------------------------
+local function HandleStandardAnimationPlay(character, track)
+    if not tog("AutoBlockEnabled") then return end
+    local anim = track and track.Animation
+    if not anim then return end
+
+    local rawId = RawId(anim.AnimationId)
+    if rawId and ProjectileAnimations[rawId] then return end
+
+    local animName = anim.Name
+    if IsMovementName(animName) then return end
+    if ExclusionSet[animName] then return end
+    if Players:GetPlayerFromCharacter(character) == LocalPlayer then return end
+    if not tog("BlockWhileAttacking") and IsLocalPlayerAttacking() then return end
+    if IsIncapacitated(LocalChar) or IsIncapacitated(character) then return end
+    if not LocalRoot then return end
+
+    local targetRoot = character:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then return end
+
+    local delta = targetRoot.Position - LocalRoot.Position
+    if delta.Magnitude > opt("DetectionRange", 25) then return end
+
+    if tog("FacingCheckEnabled") then
+        local dot = targetRoot.CFrame.LookVector:Dot(-delta.Unit)
+        if dot < opt("FacingAngleThreshold", 0.5) then return end
+    end
+    if IsEnemyFeinting(character) then return end
+    if ActiveBlockingTracks[track] then return end
+
+    ActiveBlockingTracks[track] = true
+    FireBlockActivated()
+
+    if tog("BlockForAnimation") then
+        ReleaseOn(ActiveBlockingTracks, track, 5)
+    elseif tog("BlockForDuration") then
+        task.delay(opt("BlockDuration", 0.5), function()
+            if ActiveBlockingTracks[track] then
+                ActiveBlockingTracks[track] = nil
+                FireBlockDeactivated()
+            end
+        end)
+    end
+end
+
+--// Auto counter ----------------------------------------------------------------
+local function fireManjiKickService()
+    if not tog("AutoCounterEnabled") then return end
+    local moveset = LocalChar and LocalChar:FindFirstChild("Moveset")
+    local move = moveset and moveset:FindFirstChild("Manji Kick")
+    if move then FireRemote("ManjiKickService", "Activated", move) end
+end
